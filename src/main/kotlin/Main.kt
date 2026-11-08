@@ -26,7 +26,7 @@ import kotlin.system.exitProcess
  */
 @Command(
     name = "chmlFrp-cli",
-    version = ["2.1.0"],
+    version = ["2.2.0"],
     description = ["命令行工具，用于获取远程FRP配置并启动FRP客户端"],
     mixinStandardHelpOptions = true
 )
@@ -53,10 +53,61 @@ class FrpClient : Callable<Int> {
     @Option(names = ["--stop-all"], description = ["停止所有本地运行的frpc"], required = false)
     private var stopAll: Boolean = false
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-        .build()
+    @Option(names = ["--proxy"], description = ["指定代理 host:port（默认不走任何代理，直连服务器）"], required = false)
+    private var proxyArg: String? = null
+
+    @Option(names = ["--refresh-token"], description = ["直接指定refresh_token（与--token配合使用）"], required = false)
+    private var cliRefreshToken: String? = null
+
+    private val client: OkHttpClient by lazy { buildHttpClient() }
+
+    /**
+     * 默认直连（Proxy.NO_PROXY），避免系统代理/环境变量代理劫持请求——
+     * 当代理端口未开放时会导致连不上服务器。显式传 --proxy 时才走代理。
+     */
+    private fun buildHttpClient(): OkHttpClient {
+        val builder = OkHttpClient.Builder()
+            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        val proxy = parseProxy(proxyArg)
+        if (proxy != null) {
+            builder.proxy(proxy)
+            println("使用代理: ${proxy.address()}")
+        } else {
+            builder.proxy(java.net.Proxy.NO_PROXY)
+        }
+        return builder.build()
+    }
+
+    private fun parseProxy(arg: String?): java.net.Proxy? {
+        if (arg.isNullOrBlank()) return null
+        return try {
+            val (host, port) = if (arg.contains(":")) {
+                val idx = arg.lastIndexOf(':')
+                arg.substring(0, idx) to arg.substring(idx + 1).toInt()
+            } else {
+                arg to 7890
+            }
+            java.net.Proxy(java.net.Proxy.Type.HTTP, java.net.InetSocketAddress(host, port))
+        } catch (e: Exception) {
+            println("代理参数无效: $arg (${e.message})，将使用直连")
+            null
+        }
+    }
+
+    /** 代理相关环境变量：传给 frpc 子进程前清除，避免离线时代理劫持 frpc 连接 */
+    private val proxyEnvKeys = listOf(
+        "http_proxy", "https_proxy", "all_proxy", "ftp_proxy",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY"
+    )
+
+    private fun ProcessBuilder.stripProxyEnv(): ProcessBuilder {
+        try {
+            val env = environment()
+            proxyEnvKeys.forEach { env.remove(it) }
+        } catch (_: Exception) {}
+        return this
+    }
 
     private val osName = System.getProperty("os.name").lowercase()
     private val isWindows = osName.contains("win")
@@ -87,6 +138,13 @@ class FrpClient : Callable<Int> {
 
         if (cliToken != null) {
             accessToken = cliToken!!
+            if (cliRefreshToken != null) {
+                refreshToken = cliRefreshToken!!
+            }
+            // CLI传入的token为准，有效期未知先视为有效；若实际已过期，API返回401时会自动触发刷新
+            expiresAt = System.currentTimeMillis() / 1000 + 3600
+            // CLI传入的token持久化，便于后续自动刷新
+            saveTokenToConfig()
         }
 
         if (accessToken.isEmpty()) {
@@ -145,6 +203,7 @@ class FrpClient : Callable<Int> {
         }
 
         while (true) {
+            ensureValidToken() // 交互模式下保持token有效，必要时静默续期
             configList.clear()
             fetchRemoteConfigs()
             val running = getRunningFrpcProcesses()
@@ -413,10 +472,21 @@ class FrpClient : Callable<Int> {
                 }
 
                 val json = JSON.parseObject(body)
-                accessToken = json.getString("access_token") ?: throw Exception("响应中缺少access_token")
-                refreshToken = json.getString("refresh_token") ?: ""
-                val expiresIn = json.getLong("expires_in") ?: 3600L
+                // token字段可能在顶层，也可能嵌套在 data 对象里
+                val tokenObj = json.getJSONObject("data") ?: json
+                accessToken = getJsonString(tokenObj, "access_token")
+                    ?: getJsonString(json, "access_token")
+                    ?: throw Exception("响应中缺少access_token (响应字段: ${json.keys})")
+                refreshToken = getJsonString(tokenObj, "refresh_token")
+                    ?: getJsonString(json, "refresh_token")
+                    ?: ""
+                val expiresIn = getJsonLong(tokenObj, "expires_in") ?: getJsonLong(json, "expires_in") ?: 3600L
                 expiresAt = System.currentTimeMillis() / 1000 + expiresIn
+                if (refreshToken.isEmpty()) {
+                    println("警告: 服务端未返回refresh_token，token过期后需要重新登录")
+                    println("调试: token响应字段: ${json.keys}" +
+                        (if (json["data"] is com.alibaba.fastjson2.JSONObject) ", data内字段: ${tokenObj.keys}" else ""))
+                }
 
                 saveTokenToConfig()
                 println("登录成功！Token已保存到 $CONFIG_FILE")
@@ -451,12 +521,112 @@ class FrpClient : Callable<Int> {
 
     // ==================== Token Management ====================
 
+    /** 兼容 snake_case 与 camelCase 两种字段命名读取字符串 */
+    private fun getJsonString(json: com.alibaba.fastjson2.JSONObject, snake: String): String? {
+        val camel = snake.split("_").mapIndexed { i, s -> if (i == 0) s else s.replaceFirstChar { it.uppercase() } }.joinToString("")
+        return json.getString(snake) ?: json.getString(camel)
+    }
+
+    private fun getJsonLong(json: com.alibaba.fastjson2.JSONObject, snake: String): Long? {
+        val camel = snake.split("_").mapIndexed { i, s -> if (i == 0) s else s.replaceFirstChar { it.uppercase() } }.joinToString("")
+        return json.getLong(snake) ?: json.getLong(camel)
+    }
+
     private fun ensureValidToken(): Boolean {
         val now = System.currentTimeMillis() / 1000
         if (expiresAt > now + 60) return true
-        if (refreshToken.isEmpty()) return false
-        println("Token即将过期，正在刷新...")
-        return doRefreshToken()
+        if (refreshToken.isNotEmpty()) {
+            println("Token即将过期，正在刷新...")
+            if (doRefreshToken()) return true
+        }
+        // 无refresh_token（或刷新失败）：利用浏览器已有登录态静默重走授权码流程换新token
+        println("正在通过浏览器登录态静默续期...")
+        return silentRelogin()
+    }
+
+    /**
+     * 静默续期：服务端未签发refresh_token时，重开一次授权URL。
+     * 浏览器保持登录态时无需人工操作，会直接回调chmlerp://协议，
+     * 协议处理器把code写入临时文件，这里轮询读取后换新token。
+     */
+    private fun silentRelogin(): Boolean {
+        return try {
+            val (codeVerifier, codeChallenge) = generatePkce()
+            val state = UUID.randomUUID().toString().replace("-", "")
+            val redirectEncoded = URLEncoder.encode(REDIRECT_URI, "UTF-8")
+            val scopeEncoded = URLEncoder.encode(SCOPES, "UTF-8")
+            val authUrl = "$AUTHORIZE_URL?response_type=code&client_id=$CLIENT_ID" +
+                          "&redirect_uri=$redirectEncoded&scope=$scopeEncoded" +
+                          "&state=$state&code_challenge=$codeChallenge&code_challenge_method=S256"
+
+            val responseFile = File(tempDir, OAUTH_RESPONSE_FILE)
+            responseFile.delete()
+
+            openBrowser(authUrl)
+            println("已打开浏览器，若登录态有效将自动完成续期；若浏览器要求重新登录，请在 ${SILENT_RELOGIN_TIMEOUT_MS / 1000} 秒内完成登录，程序会自动继续")
+
+            val deadline = System.currentTimeMillis() + SILENT_RELOGIN_TIMEOUT_MS
+            while (System.currentTimeMillis() < deadline) {
+                if (responseFile.exists()) {
+                    Thread.sleep(300) // 等文件写完
+                    val content = responseFile.readText().trim()
+                    responseFile.delete()
+                    val params = content.split("&").filter { it.contains("=") }.associate {
+                        val idx = it.indexOf("=")
+                        it.substring(0, idx) to it.substring(idx + 1)
+                    }
+                    when {
+                        params["error"] != null -> {
+                            println("静默续期被拒绝: ${params["error"]}")
+                            return false
+                        }
+                        params["code"] != null && params["state"] == state ->
+                            return exchangeAndSave(params["code"]!!, codeVerifier)
+                        else -> {
+                            println("静默续期回调数据异常")
+                            return false
+                        }
+                    }
+                }
+                Thread.sleep(500)
+            }
+            println("静默续期超时（浏览器登录态可能已失效），请手动重新登录: chmlfrp-cli --login")
+            false
+        } catch (e: Exception) {
+            println("静默续期异常: ${e.message}")
+            false
+        }
+    }
+
+    /** 授权码换token并保存，成功返回true */
+    private fun exchangeAndSave(code: String, codeVerifier: String): Boolean {
+        return try {
+            val formBody = FormBody.Builder()
+                .add("grant_type", "authorization_code")
+                .add("code", code)
+                .add("redirect_uri", REDIRECT_URI)
+                .add("client_id", CLIENT_ID)
+                .add("code_verifier", codeVerifier)
+                .build()
+            client.newCall(Request.Builder().url(TOKEN_URL).post(formBody).build()).execute().use { response ->
+                val body = response.body?.string() ?: return false
+                if (!response.isSuccessful) {
+                    println("续期换token失败: ${response.code}")
+                    return false
+                }
+                val json = JSON.parseObject(body)
+                val tokenObj = json.getJSONObject("data") ?: json
+                accessToken = getJsonString(tokenObj, "access_token") ?: getJsonString(json, "access_token") ?: return false
+                refreshToken = getJsonString(tokenObj, "refresh_token") ?: getJsonString(json, "refresh_token") ?: ""
+                expiresAt = System.currentTimeMillis() / 1000 + (getJsonLong(tokenObj, "expires_in") ?: getJsonLong(json, "expires_in") ?: 600L)
+                saveTokenToConfig()
+                println(if (refreshToken.isNotEmpty()) "Token已续期（获得refresh_token）" else "Token已续期（服务端仍未返回refresh_token，下次过期将再次静默续期）")
+                true
+            }
+        } catch (e: Exception) {
+            println("续期换token异常: ${e.message}")
+            false
+        }
     }
 
     private fun doRefreshToken(): Boolean {
@@ -476,9 +646,9 @@ class FrpClient : Callable<Int> {
                 val body = response.body?.string() ?: return false
                 val json = JSON.parseObject(body)
 
-                accessToken = json.getString("access_token") ?: return false
-                refreshToken = json.getString("refresh_token") ?: refreshToken
-                val expiresIn = json.getLong("expires_in") ?: 3600L
+                accessToken = getJsonString(json, "access_token") ?: return false
+                refreshToken = getJsonString(json, "refresh_token") ?: refreshToken
+                val expiresIn = getJsonLong(json, "expires_in") ?: 3600L
                 expiresAt = System.currentTimeMillis() / 1000 + expiresIn
 
                 saveTokenToConfig()
@@ -529,13 +699,17 @@ class FrpClient : Callable<Int> {
             client.newCall(authedRequest(TUNNEL_API_URL).get().build()).execute().use { response ->
                 if (response.code == 401) {
                     println("Token已过期，尝试刷新...")
-                    if (doRefreshToken()) {
+                    if (refreshToken.isEmpty() || !doRefreshToken()) {
+                        // 无refresh_token或刷新失败，走浏览器静默续期
+                        ensureValidToken()
+                    }
+                    if (accessToken.isNotEmpty()) {
                         client.newCall(authedRequest(TUNNEL_API_URL).get().build()).execute().use { retry ->
                             val body = retry.body?.string() ?: throw Exception("响应为空")
                             parseConfigList(body)
                         }
                     } else {
-                        println("Token刷新失败，请重新登录: chmlfrp-cli --login")
+                        println("Token续期失败，请重新登录: chmlfrp-cli --login")
                     }
                     return
                 }
@@ -552,8 +726,8 @@ class FrpClient : Callable<Int> {
         try {
             val apiResponse = JSON.parseObject(json, ApiResponse::class.java)
             if (apiResponse.code == 200 && apiResponse.state == "success") {
-                configList.addAll(apiResponse.data)
-                println("成功获取到 ${apiResponse.data.size} 个隧道配置")
+                apiResponse.data?.let { configList.addAll(it) }
+                println("成功获取到 ${apiResponse.data?.size ?: 0} 个隧道配置")
             } else {
                 println("API返回错误: ${apiResponse.msg}")
             }
@@ -854,6 +1028,13 @@ class FrpClient : Callable<Int> {
                     val batchContent = """
                         @echo off
                         chcp 936 >nul
+                        rem 清除代理环境变量，避免代理离线时frpc连不上服务器
+                        set http_proxy=
+                        set https_proxy=
+                        set all_proxy=
+                        set HTTP_PROXY=
+                        set HTTPS_PROXY=
+                        set ALL_PROXY=
                         echo ========================================
                         echo  FRP: ${config.name}
                         echo  Node: ${config.node} (${config.node_ip})
@@ -868,12 +1049,14 @@ class FrpClient : Callable<Int> {
 
                     val pb = ProcessBuilder()
                     pb.command("cmd.exe", "/c", "start", "\"FRP - ${config.name}\"", batchFile.absolutePath)
-                    pb.start()
+                    pb.stripProxyEnv().start()
                     println("FRP客户端已在新窗口中启动")
                 } else {
                     val shellFile = File(tempDir, "start_frpc_${config.id}.sh")
                     val shellContent = """
                         #!/bin/bash
+                        # 清除代理环境变量，避免代理离线时frpc连不上服务器
+                        unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
                         echo "========================================"
                         echo " FRP: ${config.name}"
                         echo " Node: ${config.node} (${config.node_ip})"
@@ -920,7 +1103,7 @@ class FrpClient : Callable<Int> {
                             try {
                                 val pb = ProcessBuilder(*terminal)
                                 pb.redirectErrorStream(true)
-                                val proc = pb.start()
+                                val proc = pb.stripProxyEnv().start()
                                 delay(1000)
                                 if (!proc.isAlive && proc.exitValue() != 0) continue
                                 println("FRP客户端已在新窗口中启动 (${terminal[0]})")
@@ -934,7 +1117,7 @@ class FrpClient : Callable<Int> {
                         if (!success) {
                             try {
                                 val pb = ProcessBuilder("x-terminal-emulator", "-e", "bash ${shellFile.absolutePath}")
-                                pb.start()
+                                pb.stripProxyEnv().start()
                                 delay(1000)
                                 success = true
                                 println("FRP客户端已在系统默认终端中启动")
@@ -944,7 +1127,7 @@ class FrpClient : Callable<Int> {
                         if (!success) {
                             println("无法找到可用的终端模拟器，将在当前终端运行")
                             val pb = ProcessBuilder("bash", shellFile.absolutePath)
-                            pb.start()
+                            pb.stripProxyEnv().start()
                         }
                     }
                 }
@@ -966,6 +1149,7 @@ class FrpClient : Callable<Int> {
         private const val REDIRECT_URI = "chmlerp://oauth/callback"
         private const val CONFIG_FILE = "user.config"
         private const val OAUTH_RESPONSE_FILE = "chmlfrp_oauth_response.txt"
+        private const val SILENT_RELOGIN_TIMEOUT_MS = 3 * 60 * 1000L
         private val tempDir = File(System.getProperty("java.io.tmpdir"))
 
         @JvmStatic
@@ -986,7 +1170,7 @@ class FrpClient : Callable<Int> {
                           \ \  \____\ \  \ \  \ \  \    \ \  \ \  \____\ \  \_| \ \  \\  \\ \  \___\|____________|\ \  \____\ \  \____\ \  \
                            \ \_______\ \__\ \__\ \__\    \ \__\ \_______\ \__\   \ \__\\ _\\ \__\                  \ \_______\ \_______\ \__\
                             \|_______|\|__|\|__|\|__|     \|__|\|_______|\|__|    \|__|\|__|\|__|                   \|_______|\|_______|\|__|
-                        version 2.1.0
+                        version 2.2.0
                     """.trimIndent()
                     println(CommandLine.Help.Ansi.AUTO.text("@|bold,cyan $banner|@"))
                     CommandLine.RunLast().execute(parseResult)
@@ -1042,8 +1226,8 @@ data class FrpConfig(
 )
 
 data class ApiResponse(
-    val msg: String,
-    val code: Int,
-    val data: List<FrpConfig>,
-    val state: String
+    val msg: String? = null,
+    val code: Int = 0,
+    val data: List<FrpConfig>? = null,
+    val state: String? = null
 )
