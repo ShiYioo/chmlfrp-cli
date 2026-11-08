@@ -9,6 +9,8 @@ version = "2.2.0"
 
 
 repositories {
+    // 阿里云镜像优先，规避 Maven Central / GitHub Releases CDN 故障，国内构建也更快
+    maven("https://maven.aliyun.com/repository/public")
     mavenCentral()
 }
 
